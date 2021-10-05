@@ -120,7 +120,6 @@ def get_eH_features(mol):
         # if atom.GetAtomicNum() == 1:
         #     continue
         idx = atom.GetIdx()
-        symbol = atom.GetSymbol().upper()
         atom.SetDoubleProp("eHCharge", charges[idx])
         _i += 1
 
