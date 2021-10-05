@@ -11,6 +11,7 @@ from torch_geometric.datasets import MoleculeNet
 from torch_geometric.utils import degree
 from torch_geometric.nn.functional import bro, gini
 
+from .molecule_net import MoleculeNetEH
 from .mol_encoder import AtomEncoder, BondEncoder
 
 cls_criterion = BCEWithLogitsLoss()
@@ -22,13 +23,17 @@ class MolData(LightningDataModule):
             self,
             root,
             name,
+            eh_feat=False,
             batch_size=32,
     ):
         super().__init__()
         self.name = name
         self.root = root
         self.batch_size = batch_size
-        self.dataset_class = MoleculeNet
+        if eh_feat:
+            self.dataset_class = MoleculeNetEH
+        else:
+            self.dataset_class = MoleculeNet
         # only need the split idx from the ogb dataset
         ogb_name = f'ogbg-mol{name}'
         ogb_dataset = PygGraphPropPredDataset(name=ogb_name, root='/tmp/ogb')
@@ -68,14 +73,14 @@ class MolData(LightningDataModule):
 
 
 class GINConv(MessagePassing):
-    def __init__(self, emb_dim):
+    def __init__(self, emb_dim, eh_feat=False):
         '''
             emb_dim (int): node embedding dimensionality
         '''
         super(GINConv, self).__init__(aggr="add")
         self.mlp = Sequential(Linear(emb_dim, 2*emb_dim), BatchNorm1d(2*emb_dim), ReLU(), Linear(2*emb_dim, emb_dim))
         self.eps = Parameter(Tensor([0]))
-        self.bond_encoder = BondEncoder(emb_dim=emb_dim)
+        self.bond_encoder = BondEncoder(emb_dim=emb_dim, eh_feat=eh_feat)
 
     def forward(self, x, edge_index, edge_attr):
         edge_embedding = self.bond_encoder(edge_attr)
@@ -91,12 +96,12 @@ class GINConv(MessagePassing):
 
 
 class GCNConv(MessagePassing):
-    def __init__(self, emb_dim):
+    def __init__(self, emb_dim, eh_feat=False):
         super(GCNConv, self).__init__(aggr='add')
 
         self.linear = Linear(emb_dim, emb_dim)
         self.root_emb = Embedding(1, emb_dim)
-        self.bond_encoder = BondEncoder(emb_dim=emb_dim)
+        self.bond_encoder = BondEncoder(emb_dim=emb_dim, eh_feat=eh_feat)
 
     def forward(self, x, edge_index, edge_attr):
         x = self.linear(x)
@@ -160,7 +165,7 @@ class Net(LightningModule):
         )
         return parent_parser
 
-    def __init__(self, task_type, num_tasks, evaluator, conf):
+    def __init__(self, task_type, eh_feat, num_tasks, evaluator, conf):
         super().__init__()
         self.save_hyperparameters(conf)
         self.n_conv_layers = self.hparams.n_conv_layers
@@ -174,11 +179,12 @@ class Net(LightningModule):
         self.BRO = self.hparams.BRO
         self.gini = self.hparams.gini
 
+        self.eh_feat = eh_feat
         self.task_type = task_type
         self.num_tasks = num_tasks
         self.evaluator = evaluator
 
-        self.atom_encoder = AtomEncoder(emb_dim=self.embedding_dim)
+        self.atom_encoder = AtomEncoder(emb_dim=self.embedding_dim, eh_feat=self.eh_feat)
 
         if self.virtual_node:
             self.virtualnode_embedding = Embedding(1, self.embedding_dim)
@@ -204,7 +210,7 @@ class Net(LightningModule):
             self.conv = GCNConv
 
         for _ in range(self.n_conv_layers):
-            self.convs.append(self.conv(self.embedding_dim))
+            self.convs.append(self.conv(self.embedding_dim, self.eh_feat))
             self.batch_norms.append(BatchNorm1d(self.embedding_dim))
 
         self.graph_pred_linear = Linear(self.embedding_dim, self.num_tasks)

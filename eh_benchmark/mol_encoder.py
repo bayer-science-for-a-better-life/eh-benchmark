@@ -30,13 +30,16 @@ def get_bond_feature_dims():
 
 class AtomEncoder(torch.nn.Module):
 
-    def __init__(self, emb_dim):
+    def __init__(self, emb_dim, eh_feat=False):
         super(AtomEncoder, self).__init__()
 
         full_atom_feature_dims = get_atom_feature_dims()
 
         self.atom_embedding_list = torch.nn.ModuleList()
-
+        self.eh_feat = eh_feat
+        if eh_feat:
+            self.eh_embedding = torch.nn.Linear(2, emb_dim)
+            torch.nn.init.xavier_uniform_(self.eh_embedding.weight.data)
         for i, dim in enumerate(full_atom_feature_dims):
             emb = torch.nn.Embedding(dim, emb_dim)
             torch.nn.init.xavier_uniform_(emb.weight.data)
@@ -44,6 +47,12 @@ class AtomEncoder(torch.nn.Module):
 
     def forward(self, x):
         x_embedding = 0
+        if self.eh_feat:
+            for i in range(x.shape[1] - 2):
+                x_embedding += self.atom_embedding_list[i](x[:, i].long())
+            x_embedding += self.eh_embedding(x[:, -2:])
+            return x_embedding
+
         for i in range(x.shape[1]):
             x_embedding += self.atom_embedding_list[i](x[:, i])
 
@@ -52,12 +61,16 @@ class AtomEncoder(torch.nn.Module):
 
 class BondEncoder(torch.nn.Module):
 
-    def __init__(self, emb_dim):
+    def __init__(self, emb_dim, eh_feat=False):
         super(BondEncoder, self).__init__()
 
         full_bond_feature_dims = get_bond_feature_dims()
 
         self.bond_embedding_list = torch.nn.ModuleList()
+        self.eh_feat = eh_feat
+        if eh_feat:
+            self.eh_embedding = torch.nn.Linear(1, emb_dim)
+            torch.nn.init.xavier_uniform_(self.eh_embedding.weight.data)
 
         for i, dim in enumerate(full_bond_feature_dims):
             emb = torch.nn.Embedding(dim, emb_dim)
@@ -66,6 +79,11 @@ class BondEncoder(torch.nn.Module):
 
     def forward(self, edge_attr):
         bond_embedding = 0
+        if self.eh_feat:
+            for i in range(edge_attr.shape[1] - 1):
+                bond_embedding += self.bond_embedding_list[i](edge_attr[:, i].long())
+            bond_embedding += self.eh_embedding(edge_attr[:, -1:])
+            return bond_embedding
         for i in range(edge_attr.shape[1]):
             bond_embedding += self.bond_embedding_list[i](edge_attr[:, i])
 

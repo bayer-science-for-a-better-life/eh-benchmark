@@ -2,6 +2,10 @@ import os
 import os.path as osp
 import re
 
+import numpy as np
+from rdkit.Chem import AllChem
+from rdkit.Chem import rdEHTTools
+from rdkit import Chem
 import torch
 from torch_geometric.data import (InMemoryDataset, Data, download_url,
                                   extract_gz)
@@ -58,7 +62,72 @@ e_map = {
 }
 
 
-class MoleculeNetHBonds(InMemoryDataset):
+def set_overlap_populations(m, rop, n_atoms):
+    for bnd in m.GetBonds():
+        a1 = bnd.GetBeginAtom()
+        a2 = bnd.GetEndAtom()
+        if a1.GetIdx() >= n_atoms:
+            continue
+        if a2.GetIdx() >= n_atoms:
+            continue
+        # symmetric matrix:
+        i1 = max(a1.GetIdx(), a2.GetIdx())
+        i2 = min(a1.GetIdx(), a2.GetIdx())
+        idx = (i1 * (i1 + 1)) // 2 + i2
+        bnd.SetDoubleProp("MullikenOverlapPopulation", rop[idx])
+
+    for atom in m.GetAtoms():
+        if atom.GetIdx() >= n_atoms:
+            break
+        i1 = atom.GetIdx()
+        idx = (i1 * (i1 + 1)) // 2 + i1
+        atom.SetDoubleProp("MullikenPopulation", rop[idx])
+
+
+def get_eH_features(mol):
+    # add hydrogens
+    mh = Chem.AddHs(mol)
+    n_atoms = mol.GetNumAtoms()
+
+    try:
+        AllChem.EmbedMultipleConfs(mh, numConfs=10, useRandomCoords=True, maxAttempts=100)
+        res = AllChem.MMFFOptimizeMoleculeConfs(mh)
+        min_energy_conf = np.argmin([x[1] for x in res])
+        # this can throw a ValueError, which should be caught in the process loop
+        passed, res = rdEHTTools.RunMol(mol=mh, confId=int(min_energy_conf), keepOverlapAndHamiltonianMatrices=True)
+        if passed < 0:
+            raise ValueError
+        rop = res.GetReducedOverlapPopulationMatrix()
+        charges = res.GetAtomicCharges()
+        orbital_E = res.GetOrbitalEnergies()
+        homo = orbital_E[res.numElectrons // 2 - 1]
+        lumo = orbital_E[res.numElectrons // 2]
+    except ValueError:
+        # place dummy values
+        rop = np.ones(mh.GetNumAtoms()**2)
+        charges = 3. * np.ones(mh.GetNumAtoms())
+        homo = -10.
+        lumo = -2.
+
+    # set bond and atom electron populations
+    set_overlap_populations(mh, rop, n_atoms)
+
+    # set atomic charges and ionization potentials
+    _i = 0
+    for atom in mh.GetAtoms():
+        if _i >= n_atoms:
+            break
+        # if atom.GetAtomicNum() == 1:
+        #     continue
+        idx = atom.GetIdx()
+        symbol = atom.GetSymbol().upper()
+        atom.SetDoubleProp("eHCharge", charges[idx])
+        _i += 1
+
+    return mh, homo, lumo, n_atoms
+
+
+class MoleculeNetEH(InMemoryDataset):
     r"""The `MoleculeNet <http://moleculenet.ai/datasets-1>`_ benchmark
     collection  from the `"MoleculeNet: A Benchmark for Molecular Machine
     Learning" <https://arxiv.org/abs/1703.00564>`_ paper, containing datasets
@@ -115,7 +184,7 @@ class MoleculeNetHBonds(InMemoryDataset):
                  pre_filter=None):
         self.name = name.lower()
         assert self.name in self.names.keys()
-        super(MoleculeNetHBonds, self).__init__(root, transform, pre_transform, pre_filter)
+        super(MoleculeNetEH, self).__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
 
     @property
@@ -141,9 +210,7 @@ class MoleculeNetHBonds(InMemoryDataset):
             extract_gz(path, self.raw_dir)
             os.unlink(path)
 
-    def process(self):
-        from rdkit import Chem
-
+    def process(self):  # noqa
         with open(self.raw_paths[0], 'r') as f:
             dataset = f.read().split('\n')[1:-1]
             dataset = [x for x in dataset if len(x) > 0]  # Filter empty lines.
@@ -164,8 +231,12 @@ class MoleculeNetHBonds(InMemoryDataset):
             if mol is None:
                 continue
 
+            mh, eH_homo, eH_lumo, n_atoms = get_eH_features(mol)
+
             xs = []
-            for atom in mol.GetAtoms():
+            for _i, atom in enumerate(mh.GetAtoms()):
+                if _i >= n_atoms:
+                    break
                 x = []
                 x.append(x_map['atomic_num'].index(atom.GetAtomicNum()))
                 x.append(x_map['chirality'].index(str(atom.GetChiralTag())))
@@ -178,12 +249,19 @@ class MoleculeNetHBonds(InMemoryDataset):
                     str(atom.GetHybridization())))
                 x.append(x_map['is_aromatic'].index(atom.GetIsAromatic()))
                 x.append(x_map['is_in_ring'].index(atom.IsInRing()))
+                # add eH features
+                x.append(atom.GetDoubleProp("eHCharge"))
+                x.append(atom.GetDoubleProp("MullikenPopulation"))
                 xs.append(x)
 
-            x = torch.tensor(xs, dtype=torch.long).view(-1, 9)
+            x = torch.tensor(xs).view(-1, 11)
 
             edge_indices, edge_attrs = [], []
-            for bond in mol.GetBonds():
+            for bond in mh.GetBonds():
+                if bond.GetBeginAtomIdx() >= n_atoms:
+                    continue
+                if bond.GetEndAtomIdx() >= n_atoms:
+                    continue
                 i = bond.GetBeginAtomIdx()
                 j = bond.GetEndAtomIdx()
 
@@ -191,13 +269,15 @@ class MoleculeNetHBonds(InMemoryDataset):
                 e.append(e_map['bond_type'].index(str(bond.GetBondType())))
                 e.append(e_map['stereo'].index(str(bond.GetStereo())))
                 e.append(e_map['is_conjugated'].index(bond.GetIsConjugated()))
+                # add eH features
+                e.append(bond.GetDoubleProp('MullikenOverlapPopulation'))
 
                 edge_indices += [[i, j], [j, i]]
                 edge_attrs += [e, e]
 
             edge_index = torch.tensor(edge_indices)
             edge_index = edge_index.t().to(torch.long).view(2, -1)
-            edge_attr = torch.tensor(edge_attrs, dtype=torch.long).view(-1, 3)
+            edge_attr = torch.tensor(edge_attrs).view(-1, 4)
 
             # Sort indices.
             if edge_index.numel() > 0:
